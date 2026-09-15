@@ -100,25 +100,13 @@ def login(page, username, password):
 
 def find_server_links(page):
     """
-    收集服务器详情页链接。Pterodactyl 类系面板通常每个服务器卡片是
-    <a href="/server/xxxx"> 或包含 "Manage"/"Console" 字样的按钮。
+    收集服务器详情页链接。优先按 href 是否包含 "/server/" 判断，
+    这是实测中真正的游戏服务器详情页特征；
+    "Manage"/"Console" 这类文字按钮可能会误匹配到订阅管理等无关页面，仅作兜底。
     """
     log(f"正在打开 Dashboard: {DASHBOARD_URL}")
     page.goto(DASHBOARD_URL, timeout=60000)
     page.wait_for_timeout(3000)
-
-    candidate_texts = ["Manage Server", "Manage", "Console", "View Server"]
-    for text in candidate_texts:
-        links = page.locator(f'a:has-text("{text}")')
-        count = links.count()
-        if count > 0:
-            hrefs = []
-            for i in range(count):
-                href = links.nth(i).get_attribute("href")
-                if href and href not in hrefs:
-                    hrefs.append(href)
-            log(f"通过 '{text}' 按钮找到 {len(hrefs)} 个服务器")
-            return hrefs
 
     candidate_selectors = [
         'a[href*="/server/"]',
@@ -136,53 +124,66 @@ def find_server_links(page):
             log(f"使用选择器 '{sel}' 找到 {len(hrefs)} 个服务器")
             return hrefs
 
+    candidate_texts = ["Manage Server", "Manage", "Console", "View Server"]
+    for text in candidate_texts:
+        links = page.locator(f'a:has-text("{text}")')
+        count = links.count()
+        if count > 0:
+            hrefs = []
+            for i in range(count):
+                href = links.nth(i).get_attribute("href")
+                if href and href not in hrefs:
+                    hrefs.append(href)
+            log(f"通过 '{text}' 按钮找到 {len(hrefs)} 个服务器（兜底匹配，可能包含无关链接）")
+            return hrefs
+
     warn("未匹配到任何服务器链接，请提供 Dashboard 页面截图以确定实际结构")
     return []
 
 
 def ensure_server_running(page, url):
     """
-    进入单个服务器详情页，检测状态，如果不是运行中就点击 Start。
-    Pterodactyl 类系面板常见状态文字: Running / Offline / Starting / Stopping
-    电源控制按钮常见文字: Start / Stop / Restart
+    进入单个 DevSpace 详情页，检测是否离线，离线则点击 Start container。
+    根据实际截图确认：
+    - 容器离线时页面会显示明确文字 "Container offline"，并有按钮 "Start container"
+    - 这个判断依据比读取模糊的状态文字（如 Running/Offline 泛用词）更准确，
+      因为后者容易在 WebSocket 尚未连接完成时读到过渡态/默认值
     """
     full_url = url if url.startswith("http") else f"{PANEL_URL.rstrip('/')}{url}"
     log(f"打开服务器详情页: {full_url}")
     page.goto(full_url, timeout=60000)
-    page.wait_for_timeout(4000)
+    # 延长等待时间，给 WebSocket 连接和实时状态刷新留出时间
+    page.wait_for_timeout(6000)
 
-    # 尝试读取状态文字，仅用于日志展示，不影响后续判断逻辑
-    status_texts = ["Running", "Online", "Offline", "Stopped", "Starting", "Stopping"]
-    detected_status = None
-    for s in status_texts:
-        if page.locator(f'text="{s}"').count() > 0:
-            detected_status = s
-            break
-    if detected_status:
-        log(f"检测到状态: {detected_status}")
-    else:
-        warn("未能读取到明确的运行状态文字，继续尝试查找 Start 按钮")
+    offline_indicator = page.locator('text="Container offline"')
+    is_offline = offline_indicator.count() > 0 and offline_indicator.first.is_visible(timeout=2000)
 
-    if detected_status in ("Running", "Online", "Starting"):
-        log("服务器已在运行或正在启动，无需操作")
+    if not is_offline:
+        log("未检测到 'Container offline' 提示，判断为已在运行，无需操作")
         return "already_running"
 
-    start_btn = page.locator('button:has-text("Start")')
-    if start_btn.count() > 0 and start_btn.first.is_visible(timeout=3000):
-        try:
-            if start_btn.first.is_disabled():
-                log("Start 按钮当前不可点击（可能正在启动/停止过程中），跳过")
-                return "skipped_disabled"
-        except Exception:
-            pass
-        start_btn.first.scroll_into_view_if_needed()
-        start_btn.first.click()
-        log("已点击 Start，开机指令已发送")
-        page.wait_for_timeout(3000)
-        return "started"
+    log("检测到 'Container offline'，容器已离线，尝试点击 Start container...")
 
-    warn(f"在 {full_url} 未找到可点击的 Start 按钮，请提供该页面截图以确定实际结构")
-    return "not_found"
+    start_btn = page.locator('button:has-text("Start container")')
+    if start_btn.count() == 0:
+        start_btn = page.locator('button:has-text("Start")')
+
+    if start_btn.count() == 0 or not start_btn.first.is_visible(timeout=3000):
+        warn(f"检测到离线，但在 {full_url} 未找到 Start container 按钮，请提供该页面截图确认")
+        return "not_found"
+
+    start_btn.first.scroll_into_view_if_needed()
+    start_btn.first.click()
+    log("已点击 Start container，开机指令已发送")
+    page.wait_for_timeout(4000)
+
+    try:
+        page.screenshot(path="start_result.png", full_page=True)
+        log("已保存开机点击后的截图: start_result.png（会作为 Actions Artifact 上传）")
+    except Exception as e:
+        warn(f"截图保存失败: {e}")
+
+    return "started"
 
 
 def run(playwright):
@@ -208,7 +209,7 @@ def run(playwright):
             err("未找到任何服务器，流程终止")
             return
 
-        results = {"started": 0, "already_running": 0, "skipped_disabled": 0, "not_found": 0}
+        results = {"started": 0, "already_running": 0, "not_found": 0}
         for idx, href in enumerate(hrefs):
             log(f"--- 处理第 {idx + 1}/{len(hrefs)} 个服务器 ---")
             try:
