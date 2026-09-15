@@ -45,6 +45,7 @@ jobs:
           path: |
             login_failed.png
             error.png
+            start_result.png
           if-no-files-found: ignore
           retention-days: 3
 
